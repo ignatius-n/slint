@@ -13,7 +13,11 @@ const FRONT_MATTER = [
     "---",
     "title: Third-Party Licenses",
     "slug: thirdparty",
-    "tableOfContents: false",
+    // Each license is an `h2`; limit the on-page navigation to those so it
+    // lists the licenses without the per-license "Used by"/"License Text"
+    // subheadings.
+    "tableOfContents:",
+    "    maxHeadingLevel: 2",
     "---",
     "",
     "",

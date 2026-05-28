@@ -496,8 +496,8 @@ fn crate_url(c: &CrateRef) -> String {
 fn render_markdown(sections: &[LicenseSection]) -> String {
     let mut out = String::new();
     for s in sections {
-        out.push_str(&format!("### <a id=\"{id}\"></a> {name}\n\n", id = s.id, name = s.name));
-        out.push_str("#### Used by:\n\n");
+        out.push_str(&format!("## <a id=\"{id}\"></a> {name}\n\n", id = s.id, name = s.name));
+        out.push_str("### Used by:\n\n");
         for c in &s.used_by {
             out.push_str(&format!(
                 "- [{name} {version}]({url})\n",
@@ -507,7 +507,7 @@ fn render_markdown(sections: &[LicenseSection]) -> String {
             ));
         }
         out.push_str(&format!(
-            "\n#### License Text\n\n```\n{text}\n```\n\n",
+            "\n### License Text\n\n```\n{text}\n```\n\n",
             text = s.text.trim_end()
         ));
     }
