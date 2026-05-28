@@ -34,7 +34,6 @@ const ACCEPTED: &[&str] = &[
     "OpenSSL",
     "Unlicense",
     "WTFPL",
-    "LicenseRef-Slint-Software-3.0",
 ];
 
 /// Skip dependencies reachable only through dev-dependency edges.
@@ -277,13 +276,19 @@ fn resolve_packages(
         Some(root) => vec![root],
         None => metadata.workspace_members.clone(),
     };
+    // The workspace's own crates are first-party, not third-party: we traverse
+    // through them to reach their dependencies but never list them.
+    let workspace: HashSet<&cargo_metadata::PackageId> =
+        metadata.workspace_members.iter().collect();
     let mut wanted: BTreeSet<cargo_metadata::PackageId> = BTreeSet::new();
     let mut seen: HashSet<cargo_metadata::PackageId> = HashSet::new();
     while let Some(id) = stack.pop() {
         if !seen.insert(id.clone()) {
             continue;
         }
-        wanted.insert(id.clone());
+        if !workspace.contains(&id) {
+            wanted.insert(id.clone());
+        }
         let (Some(node), Some(parent)) = (nodes.get(&id), packages.get(&id)) else { continue };
         let active: HashSet<&str> = node.features.iter().map(String::as_str).collect();
         for dep in &node.deps {
