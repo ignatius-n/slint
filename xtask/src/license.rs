@@ -39,13 +39,6 @@ const ACCEPTED: &[&str] = &[
 /// Skip dependencies reachable only through dev-dependency edges.
 const IGNORE_DEV_DEPENDENCIES: bool = true;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum Format {
-    Html,
-    /// `cargo about`-compatible JSON, consumed by the docs site generators.
-    Json,
-}
-
 #[derive(Debug, clap::Parser)]
 pub struct LicenseCommand {
     /// Path to the `Cargo.toml` whose dependencies should be analyzed.
@@ -61,9 +54,6 @@ pub struct LicenseCommand {
     /// Enable all features of the analyzed crate.
     #[arg(long)]
     all_features: bool,
-    /// Output format.
-    #[arg(long, value_enum, default_value_t = Format::Html)]
-    format: Format,
     /// Where to write the result. Writes to stdout when omitted.
     #[arg(short = 'o', long)]
     output: Option<PathBuf>,
@@ -82,7 +72,6 @@ impl LicenseCommand {
                 no_default_features: self.no_default_features,
                 all_features: self.all_features,
             },
-            format: self.format,
             output: self.output.clone(),
         })
     }
@@ -99,7 +88,6 @@ pub struct Features {
 pub struct GenerateArgs {
     pub manifest_path: PathBuf,
     pub features: Features,
-    pub format: Format,
     pub output: Option<PathBuf>,
 }
 
@@ -175,7 +163,6 @@ pub fn generate(args: &GenerateArgs) -> anyhow::Result<()> {
             let text = representative_text(&id, harvested.get(&id));
             LicenseSection {
                 name: license_names.remove(&id).unwrap_or_else(|| id.clone()),
-                count: crates.len(),
                 id,
                 text,
                 used_by: crates,
@@ -184,10 +171,7 @@ pub fn generate(args: &GenerateArgs) -> anyhow::Result<()> {
         .collect();
     sections.sort_by(|a, b| a.name.cmp(&b.name));
 
-    let rendered = match args.format {
-        Format::Html => render_html(&sections),
-        Format::Json => render_json(&sections),
-    };
+    let rendered = render_markdown(&sections);
 
     match &args.output {
         Some(path) => {
@@ -213,7 +197,6 @@ struct LicenseSection {
     id: String,
     name: String,
     text: String,
-    count: usize,
     used_by: Vec<CrateRef>,
 }
 
@@ -506,112 +489,27 @@ fn crate_url(c: &CrateRef) -> String {
     }
 }
 
-fn render_html(sections: &[LicenseSection]) -> String {
+/// Render the per-license sections as Markdown. The output carries no
+/// front matter so it can be shipped verbatim in the binary packages; the
+/// docs site generators (`docs/common/src/utils/thirdparty.ts`) prepend the
+/// Starlight front matter they need.
+fn render_markdown(sections: &[LicenseSection]) -> String {
     let mut out = String::new();
-    out.push_str(
-        r#"<!DOCTYPE html>
-<html>
-<head>
-    <style>
-        @media (prefers-color-scheme: dark) {
-            body { background: #333; color: white; }
-            a { color: skyblue; }
-        }
-        .container { font-family: sans-serif; max-width: 800px; margin: 0 auto; }
-        .intro { text-align: center; }
-        .licenses-list { list-style-type: none; margin: 0; padding: 0; }
-        .license-used-by { margin-top: -10px; }
-        .license-text { max-height: 200px; overflow-y: scroll; white-space: pre-wrap; }
-    </style>
-</head>
-<body>
-    <main class="container">
-        <div class="intro">
-            <p>This program is distributed under the terms outlined in <a href="LICENSE.md">LICENSE.md</a></p>.
-            <h1>Third Party Licenses</h1>
-            <p>This page lists the licenses of the dependencies used by this program.</p>
-        </div>
-
-        <h2>Overview of licenses:</h2>
-        <ul class="licenses-overview">
-"#,
-    );
     for s in sections {
-        out.push_str(&format!(
-            "            <li><a href=\"#{id}\">{name}</a> ({count})</li>\n",
-            id = html_escape(&s.id),
-            name = html_escape(&s.name),
-            count = s.count
-        ));
-    }
-    out.push_str("        </ul>\n\n        <h2>All license text:</h2>\n        <ul class=\"licenses-list\">\n");
-    for s in sections {
-        out.push_str("            <li class=\"license\">\n");
-        out.push_str(&format!(
-            "                <h3 id=\"{id}\">{name}</h3>\n",
-            id = html_escape(&s.id),
-            name = html_escape(&s.name)
-        ));
-        out.push_str(
-            "                <h4>Used by:</h4>\n                <ul class=\"license-used-by\">\n",
-        );
+        out.push_str(&format!("### <a id=\"{id}\"></a> {name}\n\n", id = s.id, name = s.name));
+        out.push_str("#### Used by:\n\n");
         for c in &s.used_by {
             out.push_str(&format!(
-                "                    <li><a href=\"{url}\">{name} {version}</a></li>\n",
-                url = html_escape(&crate_url(c)),
-                name = html_escape(&c.name),
-                version = html_escape(&c.version)
+                "- [{name} {version}]({url})\n",
+                name = c.name,
+                version = c.version,
+                url = crate_url(c)
             ));
         }
-        out.push_str("                </ul>\n");
         out.push_str(&format!(
-            "                <pre class=\"license-text\">{text}</pre>\n",
-            text = html_escape(&s.text)
+            "\n#### License Text\n\n```\n{text}\n```\n\n",
+            text = s.text.trim_end()
         ));
-        out.push_str("            </li>\n");
-    }
-    out.push_str("        </ul>\n    <main></body></html>\n");
-    out
-}
-
-/// Emit a subset of `cargo about`'s JSON output. The docs site generators
-/// (`docs/common/src/utils/thirdparty.ts`) consume `licenses[].{name,id,text}`
-/// and `licenses[].used_by[].crate.{name,version,repository}`.
-fn render_json(sections: &[LicenseSection]) -> String {
-    use serde_json::json;
-    let overview: Vec<_> =
-        sections.iter().map(|s| json!({ "name": s.name, "id": s.id, "count": s.count })).collect();
-    let licenses: Vec<_> = sections
-        .iter()
-        .map(|s| {
-            let used_by: Vec<_> = s
-                .used_by
-                .iter()
-                .map(|c| {
-                    json!({ "crate": {
-                        "name": c.name,
-                        "version": c.version,
-                        "repository": c.repository,
-                    }})
-                })
-                .collect();
-            json!({ "name": s.name, "id": s.id, "text": s.text, "used_by": used_by })
-        })
-        .collect();
-    serde_json::to_string_pretty(&json!({ "overview": overview, "licenses": licenses }))
-        .expect("serializable")
-}
-
-fn html_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            _ => out.push(c),
-        }
     }
     out
 }
