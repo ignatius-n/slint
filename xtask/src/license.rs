@@ -98,13 +98,13 @@ pub fn generate(args: &GenerateArgs) -> anyhow::Result<()> {
 
     let packages = resolve_packages(&args.manifest_path, &args.features)?;
 
-    // Collect, per crate, the license ids that apply to it (filtered to the
-    // accepted set), and accumulate the license -> crates and license -> texts
-    // relationships.
-    let mut used_by: BTreeMap<String, Vec<CrateRef>> = BTreeMap::new();
+    // Collect, per license id, the distinct license/notice texts and the
+    // crates contributing each. Grouping by text (rather than collapsing to a
+    // single representative) preserves the per-work copyright notices that
+    // permissive licenses such as MIT, BSD and ISC require to be reproduced.
     let mut license_names: BTreeMap<String, String> = BTreeMap::new();
-    // license id -> normalized text -> number of crates contributing it
-    let mut harvested: HashMap<String, HashMap<String, usize>> = HashMap::new();
+    // license id -> normalized text -> crates carrying that exact text
+    let mut variants: BTreeMap<String, BTreeMap<String, Vec<CrateRef>>> = BTreeMap::new();
 
     for pkg in &packages {
         let Some(expression) = pkg.license.clone() else {
@@ -141,31 +141,44 @@ pub fn generate(args: &GenerateArgs) -> anyhow::Result<()> {
             .collect();
 
         for (id, full_name) in ids {
-            used_by.entry(id.clone()).or_default().push(CrateRef {
+            license_names.entry(id.clone()).or_insert(full_name);
+
+            // Use the crate's own license file when present, otherwise fall
+            // back to a notice synthesized from its authors / repository so the
+            // copyright attribution is not lost.
+            let text = match find_license_text(&id, &files) {
+                Some(text) => normalize(&text),
+                None => fallback_text(&id, pkg),
+            };
+
+            variants.entry(id).or_default().entry(text).or_default().push(CrateRef {
                 name: pkg.name.clone(),
                 version: pkg.version.to_string(),
                 repository: pkg.repository.clone(),
             });
-            license_names.entry(id.clone()).or_insert(full_name);
-
-            if let Some(text) = find_license_text(&id, &files) {
-                *harvested.entry(id).or_default().entry(normalize(&text)).or_default() += 1;
-            }
         }
     }
 
     // Build the final per-license sections.
-    let mut sections: Vec<LicenseSection> = used_by
+    let mut sections: Vec<LicenseSection> = variants
         .into_iter()
-        .map(|(id, mut crates)| {
-            crates.sort_by(|a, b| a.name.cmp(&b.name).then(a.version.cmp(&b.version)));
-            crates.dedup_by(|a, b| a.name == b.name && a.version == b.version);
-            let text = representative_text(&id, harvested.get(&id));
+        .map(|(id, texts)| {
+            let mut variants: Vec<LicenseVariant> = texts
+                .into_iter()
+                .map(|(text, mut crates)| {
+                    crates.sort_by(|a, b| a.name.cmp(&b.name).then(a.version.cmp(&b.version)));
+                    crates.dedup_by(|a, b| a.name == b.name && a.version == b.version);
+                    LicenseVariant { text, used_by: crates }
+                })
+                .collect();
+            // Most widely shared notice first, ties broken by text for a stable
+            // ordering.
+            variants
+                .sort_by(|a, b| b.used_by.len().cmp(&a.used_by.len()).then(a.text.cmp(&b.text)));
             LicenseSection {
                 name: license_names.remove(&id).unwrap_or_else(|| id.clone()),
                 id,
-                text,
-                used_by: crates,
+                variants,
             }
         })
         .collect();
@@ -196,6 +209,12 @@ struct CrateRef {
 struct LicenseSection {
     id: String,
     name: String,
+    variants: Vec<LicenseVariant>,
+}
+
+/// A distinct license/notice text under a given license id, together with the
+/// crates that ship exactly that text.
+struct LicenseVariant {
     text: String,
     used_by: Vec<CrateRef>,
 }
@@ -465,17 +484,22 @@ fn find_license_text(id: &str, files: &[(String, String)]) -> Option<String> {
     None
 }
 
-/// Pick the text shown for a license: the most frequently harvested variant,
-/// falling back to the canonical SPDX text when nothing was harvested.
-fn representative_text(id: &str, harvested: Option<&HashMap<String, usize>>) -> String {
-    if let Some((text, _)) = harvested
-        .and_then(|map| map.iter().max_by(|a, b| a.1.cmp(b.1).then(b.0.len().cmp(&a.0.len()))))
-    {
-        return text.clone();
-    }
-    spdx::license_id(id)
+/// Synthesize a notice for a crate that ships no license file: the copyright
+/// holders taken from the crate's `authors` (falling back to its repository or
+/// name) above the canonical SPDX license body, so the attribution required by
+/// permissive licenses is still reproduced.
+fn fallback_text(id: &str, pkg: &cargo_metadata::Package) -> String {
+    let holder = if !pkg.authors.is_empty() {
+        pkg.authors.join(", ")
+    } else if let Some(repository) = &pkg.repository {
+        repository.clone()
+    } else {
+        pkg.name.to_string()
+    };
+    let body = spdx::license_id(id)
         .map(|l| l.text().to_string())
-        .unwrap_or_else(|| format!("No license text available for {id}."))
+        .unwrap_or_else(|| format!("No license text available for {id}."));
+    normalize(&format!("Copyright (c) {holder}\n\n{body}"))
 }
 
 fn normalize(text: &str) -> String {
@@ -497,19 +521,24 @@ fn render_markdown(sections: &[LicenseSection]) -> String {
     let mut out = String::new();
     for s in sections {
         out.push_str(&format!("## <a id=\"{id}\"></a> {name}\n\n", id = s.id, name = s.name));
-        out.push_str("### Used by:\n\n");
-        for c in &s.used_by {
+        // Each variant is one distinct notice text shared by a set of crates;
+        // they are rendered as separate blocks so every copyright notice is
+        // reproduced.
+        for v in &s.variants {
+            out.push_str("### Used by:\n\n");
+            for c in &v.used_by {
+                out.push_str(&format!(
+                    "- [{name} {version}]({url})\n",
+                    name = c.name,
+                    version = c.version,
+                    url = crate_url(c)
+                ));
+            }
             out.push_str(&format!(
-                "- [{name} {version}]({url})\n",
-                name = c.name,
-                version = c.version,
-                url = crate_url(c)
+                "\n### License Text\n\n```\n{text}\n```\n\n",
+                text = v.text.trim_end()
             ));
         }
-        out.push_str(&format!(
-            "\n### License Text\n\n```\n{text}\n```\n\n",
-            text = s.text.trim_end()
-        ));
     }
     out
 }
