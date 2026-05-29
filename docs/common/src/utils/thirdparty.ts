@@ -6,7 +6,7 @@
 // (docs/cpp, docs/nodejs, docs/python), which differ only in the crate
 // directory and the output path.
 import { spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 const FRONT_MATTER = [
@@ -35,14 +35,19 @@ export function generateThirdPartyMarkdown(options: {
     const { crateDir, outFile } = options;
     mkdirSync(dirname(outFile), { recursive: true });
 
-    const result = spawnSync("cargo", ["xtask", "license"], {
+    // Let the generator write the Markdown body directly to the output file:
+    // the listing easily exceeds spawnSync's default stdout buffer, and
+    // inheriting stdio keeps the build log and any error visible.
+    const result = spawnSync("cargo", ["xtask", "license", "-o", outFile], {
         cwd: crateDir,
-        encoding: "utf8",
+        stdio: "inherit",
     });
     if (result.status !== 0) {
-        process.stderr.write(result.stderr ?? "");
         process.exit(result.status ?? 1);
     }
 
-    writeFileSync(outFile, FRONT_MATTER + result.stdout, "utf8");
+    // Prepend the Starlight front matter the docs site needs (the body itself
+    // is shared verbatim with the binary packages, which must not carry it).
+    const body = readFileSync(outFile, "utf8");
+    writeFileSync(outFile, FRONT_MATTER + body, "utf8");
 }
