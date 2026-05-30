@@ -439,9 +439,30 @@ fn table_cell(value: &str) -> String {
 fn render_markdown(rows: &[CrateRow], sections: &[LicenseSection]) -> String {
     let mut out = String::new();
     let ids: HashSet<&str> = sections.iter().map(|s| s.id.as_str()).collect();
-    render_table(&mut out, "Runtime dependencies", rows, Usage::Runtime, &ids);
-    render_table(&mut out, "Shared dependencies", rows, Usage::Shared, &ids);
-    render_table(&mut out, "Build dependencies", rows, Usage::Build, &ids);
+    render_table(
+        &mut out,
+        "Runtime dependencies",
+        "Linked into the program and distributed with it.",
+        rows,
+        Usage::Runtime,
+        &ids,
+    );
+    render_table(
+        &mut out,
+        "Shared dependencies",
+        "Used both at build time and linked into the program.",
+        rows,
+        Usage::Shared,
+        &ids,
+    );
+    render_table(
+        &mut out,
+        "Build dependencies",
+        "Used only while building (build scripts and proc-macros) and not distributed.",
+        rows,
+        Usage::Build,
+        &ids,
+    );
 
     out.push_str("## License texts\n\n");
     for s in sections {
@@ -452,16 +473,18 @@ fn render_markdown(rows: &[CrateRow], sections: &[LicenseSection]) -> String {
 }
 
 /// Render one dependency table (Name / Author / License) for the crates with
-/// the given usage, sorted by name and version. License ids found in `ids` are
+/// the given usage, sorted by name and version, under a heading and a one-line
+/// `intro` explaining what the category means. License ids found in `ids` are
 /// linked to their text section below.
 fn render_table(
     out: &mut String,
     title: &str,
+    intro: &str,
     rows: &[CrateRow],
     usage: Usage,
     ids: &HashSet<&str>,
 ) {
-    out.push_str(&format!("## {title}\n\n"));
+    out.push_str(&format!("## {title}\n\n{intro}\n\n"));
     let mut selected: Vec<&CrateRow> = rows.iter().filter(|r| r.usage == usage).collect();
     selected.sort_by(|a, b| a.name.cmp(&b.name).then(a.version.cmp(&b.version)));
     if selected.is_empty() {
