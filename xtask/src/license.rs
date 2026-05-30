@@ -98,11 +98,12 @@ pub fn generate(args: &GenerateArgs) -> anyhow::Result<()> {
 
     let packages = resolve_packages(&args.manifest_path, &args.features)?;
 
-    // Harvest, per license id, the distinct license/notice texts (deduplicated)
-    // so every required copyright notice is reproduced, and build one summary
-    // row per crate for the dependency tables.
+    // Build one summary row per crate for the tables, and collect every accepted
+    // license id that appears in any table so each one gets a body below (the
+    // tables link to them). Per-crate attribution lives in the tables'
+    // Author / Copyright column, so the texts need only one body per license.
     let mut license_names: BTreeMap<String, String> = BTreeMap::new();
-    let mut texts: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut used_ids: BTreeSet<String> = BTreeSet::new();
     let mut rows: Vec<CrateRow> = Vec::new();
 
     for (pkg, usage) in &packages {
@@ -125,29 +126,14 @@ pub fn generate(args: &GenerateArgs) -> anyhow::Result<()> {
             );
         }
 
-        let crate_dir = pkg.manifest_path.parent().expect("manifest has a parent");
-        let files = license_files(crate_dir.as_std_path());
-
-        // A crate contributes its text under every accepted license id mentioned
-        // in its expression. For `A OR B` / `A AND B` it contributes to both.
-        let ids: BTreeSet<(String, String)> = expr
-            .requirements()
-            .filter_map(|r| {
-                let id = license_string(&r.req);
-                accepted.contains(id.as_str()).then(|| (id, license_full_name(&r.req)))
-            })
-            .collect();
-
-        for (id, full_name) in ids {
-            license_names.entry(id.clone()).or_insert(full_name);
-            // Use the crate's own license file when present, otherwise fall back
-            // to a notice synthesized from its authors / repository so the
-            // copyright attribution is not lost.
-            let text = match find_license_text(&id, &files) {
-                Some(text) => normalize(&text),
-                None => fallback_text(&id, pkg),
-            };
-            texts.entry(id).or_default().insert(text);
+        // Record the accepted license ids the crate uses, so each gets a body.
+        for req in expr.requirements() {
+            let id = license_string(&req.req);
+            if !accepted.contains(id.as_str()) {
+                continue;
+            }
+            license_names.entry(id.clone()).or_insert_with(|| license_full_name(&req.req));
+            used_ids.insert(id);
         }
 
         rows.push(CrateRow {
@@ -160,13 +146,15 @@ pub fn generate(args: &GenerateArgs) -> anyhow::Result<()> {
         });
     }
 
-    // One section per license id, holding its distinct texts.
-    let mut sections: Vec<LicenseSection> = texts
+    // One canonical license body per used license id, sorted by display name.
+    let mut sections: Vec<LicenseSection> = used_ids
         .into_iter()
-        .map(|(id, texts)| LicenseSection {
-            name: license_names.remove(&id).unwrap_or_else(|| id.clone()),
-            id,
-            texts: texts.into_iter().collect(),
+        .map(|id| {
+            let name = license_names.get(&id).cloned().unwrap_or_else(|| id.clone());
+            let text = spdx::license_id(&id)
+                .map(|l| l.text().trim().to_string())
+                .unwrap_or_else(|| format!("No license text available for {id}."));
+            LicenseSection { id, name, text }
         })
         .collect();
     sections.sort_by(|a, b| a.name.cmp(&b.name));
@@ -208,11 +196,11 @@ struct CrateRow {
     usage: Usage,
 }
 
-/// All distinct license/notice texts gathered under one license id.
+/// The canonical license body shown once under one license id.
 struct LicenseSection {
     id: String,
     name: String,
-    texts: Vec<String>,
+    text: String,
 }
 
 /// Run `cargo fetch` (for all targets) so that the relevant crate sources are
@@ -431,113 +419,6 @@ fn license_full_name(req: &spdx::LicenseReq) -> String {
     }
 }
 
-/// Collect candidate license files from a crate directory, both the
-/// conventional top-level `LICENSE*`/`COPYING*` files and any REUSE-style
-/// `LICENSES/<id>.*` files.
-fn license_files(dir: &Path) -> Vec<(String, String)> {
-    let mut result = Vec::new();
-    let mut collect = |path: &Path| {
-        if let (Ok(text), Some(name)) =
-            (std::fs::read_to_string(path), path.file_name().and_then(|n| n.to_str()))
-        {
-            result.push((name.to_string(), text));
-        }
-    };
-
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() {
-                let name = entry.file_name().to_string_lossy().to_ascii_uppercase();
-                if name.starts_with("LICENSE")
-                    || name.starts_with("LICENCE")
-                    || name.starts_with("COPYING")
-                    || name.starts_with("COPYRIGHT")
-                    || name.starts_with("UNLICENSE")
-                    || name.starts_with("NOTICE")
-                {
-                    collect(&path);
-                }
-            }
-        }
-    }
-    if let Ok(entries) = std::fs::read_dir(dir.join("LICENSES")) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() {
-                collect(&path);
-            }
-        }
-    }
-    result
-}
-
-/// Suffix found on a license file name (after `LICENSE-`/`LICENSE.`) mapped to
-/// the SPDX id it most likely refers to.
-fn suffix_to_id(suffix: &str) -> Option<&'static str> {
-    Some(match suffix.to_ascii_uppercase().as_str() {
-        "APACHE" | "APACHE2" | "APACHE-2.0" | "APACHE2.0" => "Apache-2.0",
-        "MIT" => "MIT",
-        "ZLIB" => "Zlib",
-        "MPL" | "MPL-2.0" | "MPL2" => "MPL-2.0",
-        "ISC" => "ISC",
-        "BSL" | "BOOST" => "BSL-1.0",
-        "UNICODE" => "Unicode-3.0",
-        _ => return None,
-    })
-}
-
-/// Find the license text for a given license id among the crate's license
-/// files. Matches REUSE files by stem, conventional files by suffix, and falls
-/// back to a single generic license file when the crate has only one license.
-fn find_license_text(id: &str, files: &[(String, String)]) -> Option<String> {
-    // Exact REUSE match: `LICENSES/<id>.txt` or `<id>.md`.
-    for (name, text) in files {
-        let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
-        if stem.eq_ignore_ascii_case(id) {
-            return Some(text.clone());
-        }
-    }
-    // Conventional `LICENSE-<SUFFIX>` / `LICENSE.<SUFFIX>` files.
-    for (name, text) in files {
-        let upper = name.to_ascii_uppercase();
-        let suffix = upper
-            .strip_prefix("LICENSE-")
-            .or_else(|| upper.strip_prefix("LICENSE."))
-            .or_else(|| upper.strip_prefix("LICENCE-"))
-            .or_else(|| upper.strip_prefix("LICENCE."));
-        if let Some(suffix) = suffix {
-            let suffix = suffix.rsplit_once('.').map(|(s, _)| s).unwrap_or(suffix);
-            if suffix_to_id(suffix) == Some(id) {
-                return Some(text.clone());
-            }
-        }
-    }
-    None
-}
-
-/// Synthesize a notice for a crate that ships no license file: the copyright
-/// holders taken from the crate's `authors` (falling back to its repository or
-/// name) above the canonical SPDX license body, so the attribution required by
-/// permissive licenses is still reproduced.
-fn fallback_text(id: &str, pkg: &cargo_metadata::Package) -> String {
-    let holder = if !pkg.authors.is_empty() {
-        pkg.authors.join(", ")
-    } else if let Some(repository) = &pkg.repository {
-        repository.clone()
-    } else {
-        pkg.name.to_string()
-    };
-    let body = spdx::license_id(id)
-        .map(|l| l.text().to_string())
-        .unwrap_or_else(|| format!("No license text available for {id}."));
-    normalize(&format!("Copyright (c) {holder}\n\n{body}"))
-}
-
-fn normalize(text: &str) -> String {
-    text.replace("\r\n", "\n").trim().to_string()
-}
-
 fn crate_url(name: &str, repository: &Option<String>) -> String {
     match repository {
         Some(repo) => repo.clone(),
@@ -565,9 +446,7 @@ fn render_markdown(rows: &[CrateRow], sections: &[LicenseSection]) -> String {
     out.push_str("## License texts\n\n");
     for s in sections {
         out.push_str(&format!("### <a id=\"{id}\"></a> {name}\n\n", id = s.id, name = s.name));
-        for text in &s.texts {
-            out.push_str(&format!("```\n{}\n```\n\n", text.trim_end()));
-        }
+        out.push_str(&format!("```\n{}\n```\n\n", s.text.trim_end()));
     }
     out
 }
