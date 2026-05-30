@@ -98,15 +98,14 @@ pub fn generate(args: &GenerateArgs) -> anyhow::Result<()> {
 
     let packages = resolve_packages(&args.manifest_path, &args.features)?;
 
-    // Collect, per license id, the distinct license/notice texts and the
-    // crates contributing each. Grouping by text (rather than collapsing to a
-    // single representative) preserves the per-work copyright notices that
-    // permissive licenses such as MIT, BSD and ISC require to be reproduced.
+    // Harvest, per license id, the distinct license/notice texts (deduplicated)
+    // so every required copyright notice is reproduced, and build one summary
+    // row per crate for the dependency tables.
     let mut license_names: BTreeMap<String, String> = BTreeMap::new();
-    // license id -> normalized text -> crates carrying that exact text
-    let mut variants: BTreeMap<String, BTreeMap<String, Vec<CrateRef>>> = BTreeMap::new();
+    let mut texts: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut rows: Vec<CrateRow> = Vec::new();
 
-    for pkg in &packages {
+    for (pkg, usage) in &packages {
         let Some(expression) = pkg.license.clone() else {
             bail!("Crate {} {} has no license information", pkg.name, pkg.version);
         };
@@ -129,9 +128,8 @@ pub fn generate(args: &GenerateArgs) -> anyhow::Result<()> {
         let crate_dir = pkg.manifest_path.parent().expect("manifest has a parent");
         let files = license_files(crate_dir.as_std_path());
 
-        // A crate is listed under every accepted license id mentioned in its
-        // expression. For `A OR B` where both are accepted, it appears under
-        // both; for `A AND B` likewise.
+        // A crate contributes its text under every accepted license id mentioned
+        // in its expression. For `A OR B` / `A AND B` it contributes to both.
         let ids: BTreeSet<(String, String)> = expr
             .requirements()
             .filter_map(|r| {
@@ -142,49 +140,38 @@ pub fn generate(args: &GenerateArgs) -> anyhow::Result<()> {
 
         for (id, full_name) in ids {
             license_names.entry(id.clone()).or_insert(full_name);
-
-            // Use the crate's own license file when present, otherwise fall
-            // back to a notice synthesized from its authors / repository so the
+            // Use the crate's own license file when present, otherwise fall back
+            // to a notice synthesized from its authors / repository so the
             // copyright attribution is not lost.
             let text = match find_license_text(&id, &files) {
                 Some(text) => normalize(&text),
                 None => fallback_text(&id, pkg),
             };
-
-            variants.entry(id).or_default().entry(text).or_default().push(CrateRef {
-                name: pkg.name.clone(),
-                version: pkg.version.to_string(),
-                repository: pkg.repository.clone(),
-            });
+            texts.entry(id).or_default().insert(text);
         }
+
+        rows.push(CrateRow {
+            name: pkg.name.to_string(),
+            version: pkg.version.to_string(),
+            repository: pkg.repository.clone(),
+            author: pkg.authors.join(", "),
+            license: expression,
+            usage: *usage,
+        });
     }
 
-    // Build the final per-license sections.
-    let mut sections: Vec<LicenseSection> = variants
+    // One section per license id, holding its distinct texts.
+    let mut sections: Vec<LicenseSection> = texts
         .into_iter()
-        .map(|(id, texts)| {
-            let mut variants: Vec<LicenseVariant> = texts
-                .into_iter()
-                .map(|(text, mut crates)| {
-                    crates.sort_by(|a, b| a.name.cmp(&b.name).then(a.version.cmp(&b.version)));
-                    crates.dedup_by(|a, b| a.name == b.name && a.version == b.version);
-                    LicenseVariant { text, used_by: crates }
-                })
-                .collect();
-            // Most widely shared notice first, ties broken by text for a stable
-            // ordering.
-            variants
-                .sort_by(|a, b| b.used_by.len().cmp(&a.used_by.len()).then(a.text.cmp(&b.text)));
-            LicenseSection {
-                name: license_names.remove(&id).unwrap_or_else(|| id.clone()),
-                id,
-                variants,
-            }
+        .map(|(id, texts)| LicenseSection {
+            name: license_names.remove(&id).unwrap_or_else(|| id.clone()),
+            id,
+            texts: texts.into_iter().collect(),
         })
         .collect();
     sections.sort_by(|a, b| a.name.cmp(&b.name));
 
-    let rendered = render_markdown(&sections);
+    let rendered = render_markdown(&rows, &sections);
 
     match &args.output {
         Some(path) => {
@@ -200,23 +187,32 @@ pub fn generate(args: &GenerateArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-struct CrateRef {
+/// How a third-party crate is reached from the analyzed crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Usage {
+    /// Linked into the program.
+    Runtime,
+    /// Used both at build time and linked into the program.
+    Shared,
+    /// Only used at build time (build scripts, proc-macros) and not shipped.
+    Build,
+}
+
+/// One crate's row in a dependency table.
+struct CrateRow {
     name: String,
     version: String,
     repository: Option<String>,
+    author: String,
+    license: String,
+    usage: Usage,
 }
 
+/// All distinct license/notice texts gathered under one license id.
 struct LicenseSection {
     id: String,
     name: String,
-    variants: Vec<LicenseVariant>,
-}
-
-/// A distinct license/notice text under a given license id, together with the
-/// crates that ship exactly that text.
-struct LicenseVariant {
-    text: String,
-    used_by: Vec<CrateRef>,
+    texts: Vec<String>,
 }
 
 /// Run `cargo fetch` (for all targets) so that the relevant crate sources are
@@ -240,16 +236,21 @@ fn run_cargo(args: &[&str]) -> anyhow::Result<()> {
 
 /// Resolve the dependency packages across all target platforms, restricted to
 /// the features enabled in the analyzed crate and honoring
-/// `IGNORE_DEV_DEPENDENCIES`.
+/// `IGNORE_DEV_DEPENDENCIES`, classifying each into runtime / build / shared.
 ///
 /// `cargo metadata` is run without `--filter-platform`, so its resolve graph
 /// spans every target. Its graph keeps optional dependencies even when no
 /// active feature enables them, so the walk follows only the edges that the
 /// resolved feature set of each crate actually activates.
+///
+/// The walk carries a "build" flag: it starts in runtime mode at the root and
+/// switches to build mode when it crosses a `[build-dependencies]` edge or
+/// enters a proc-macro crate (neither is linked into the program). A crate
+/// reachable in both modes is `Shared`.
 fn resolve_packages(
     manifest_path: &Path,
     features: &Features,
-) -> anyhow::Result<Vec<cargo_metadata::Package>> {
+) -> anyhow::Result<Vec<(cargo_metadata::Package, Usage)>> {
     let mut cmd = cargo_metadata::MetadataCommand::new();
     cmd.manifest_path(manifest_path);
     if !features.features.is_empty() {
@@ -274,7 +275,7 @@ fn resolve_packages(
     // Seeding from `resolve.root` (rather than every workspace member) ensures
     // we only consider the dependencies of the analyzed crate, not those of
     // unrelated examples elsewhere in the workspace.
-    let mut stack: Vec<_> = match resolve.root.clone() {
+    let seeds: Vec<_> = match resolve.root.clone() {
         Some(root) => vec![root],
         None => metadata.workspace_members.clone(),
     };
@@ -282,14 +283,20 @@ fn resolve_packages(
     // through them to reach their dependencies but never list them.
     let workspace: HashSet<&cargo_metadata::PackageId> =
         metadata.workspace_members.iter().collect();
-    let mut wanted: BTreeSet<cargo_metadata::PackageId> = BTreeSet::new();
-    let mut seen: HashSet<cargo_metadata::PackageId> = HashSet::new();
-    while let Some(id) = stack.pop() {
-        if !seen.insert(id.clone()) {
+
+    // Third-party crates reached in runtime mode and in build mode (the same
+    // crate can appear in both). `false` = runtime mode, `true` = build mode.
+    let mut runtime: HashSet<cargo_metadata::PackageId> = HashSet::new();
+    let mut build: HashSet<cargo_metadata::PackageId> = HashSet::new();
+    let mut seen: HashSet<(cargo_metadata::PackageId, bool)> = HashSet::new();
+    let mut stack: Vec<(cargo_metadata::PackageId, bool)> =
+        seeds.into_iter().map(|id| (id, false)).collect();
+    while let Some((id, build_mode)) = stack.pop() {
+        if !seen.insert((id.clone(), build_mode)) {
             continue;
         }
         if !workspace.contains(&id) {
-            wanted.insert(id.clone());
+            if build_mode { &mut build } else { &mut runtime }.insert(id.clone());
         }
         let (Some(node), Some(parent)) = (nodes.get(&id), packages.get(&id)) else { continue };
         let active: HashSet<&str> = node.features.iter().map(String::as_str).collect();
@@ -303,25 +310,50 @@ fn resolve_packages(
             if IGNORE_DEV_DEPENDENCIES && !dep.dep_kinds.is_empty() && non_dev.is_empty() {
                 continue;
             }
-            // Drop edges that only exist under a synthetic build cfg such as
-            // `cfg(fuzzing)`, `cfg(test)` or `cfg(miri)`. Those are never active
-            // in a normal build for any real target platform.
-            if !non_dev.is_empty()
-                && non_dev
-                    .iter()
-                    .all(|k| k.target.as_ref().is_some_and(|t| is_synthetic_cfg(&t.to_string())))
-            {
+            // The non-dev kinds that apply to a real target platform (ignoring
+            // synthetic build cfgs such as `cfg(fuzzing)`/`cfg(test)`/`cfg(miri)`,
+            // which are never active in a normal build).
+            let effective: Vec<_> = non_dev
+                .iter()
+                .filter(|k| !k.target.as_ref().is_some_and(|t| is_synthetic_cfg(&t.to_string())))
+                .collect();
+            // Drop edges that only exist under such synthetic cfgs.
+            if !non_dev.is_empty() && effective.is_empty() {
                 continue;
             }
             let Some(dep_pkg) = packages.get(&dep.pkg) else { continue };
-            if dependency_enabled(parent, &active, dep_pkg.name.as_str()) {
-                stack.push(dep.pkg.clone());
+            if !dependency_enabled(parent, &active, dep_pkg.name.as_str()) {
+                continue;
             }
+            // The edge stays runtime-capable if it carries a normal kind (or the
+            // resolver gave us no kinds at all); a build-only edge or a
+            // proc-macro target moves into build mode.
+            let edge_is_build = !effective.is_empty()
+                && effective.iter().all(|k| k.kind == cargo_metadata::DependencyKind::Build);
+            let next_build = build_mode || edge_is_build || is_proc_macro(dep_pkg);
+            stack.push((dep.pkg.clone(), next_build));
         }
     }
 
     let mut packages = packages;
-    Ok(wanted.into_iter().filter_map(|id| packages.remove(&id)).collect())
+    let all: BTreeSet<_> = runtime.iter().chain(build.iter()).cloned().collect();
+    Ok(all
+        .into_iter()
+        .filter_map(|id| {
+            let usage = match (runtime.contains(&id), build.contains(&id)) {
+                (true, true) => Usage::Shared,
+                (true, false) => Usage::Runtime,
+                _ => Usage::Build,
+            };
+            packages.remove(&id).map(|pkg| (pkg, usage))
+        })
+        .collect())
+}
+
+/// Whether a package is a proc-macro crate (compiled for the host and not
+/// linked into the program, hence a build-time dependency).
+fn is_proc_macro(pkg: &cargo_metadata::Package) -> bool {
+    pkg.targets.iter().any(|t| t.is_proc_macro())
 }
 
 /// Whether a `cfg(...)` target predicate references a synthetic build flag
@@ -506,39 +538,60 @@ fn normalize(text: &str) -> String {
     text.replace("\r\n", "\n").trim().to_string()
 }
 
-fn crate_url(c: &CrateRef) -> String {
-    match &c.repository {
+fn crate_url(name: &str, repository: &Option<String>) -> String {
+    match repository {
         Some(repo) => repo.clone(),
-        None => format!("https://crates.io/crates/{}", c.name),
+        None => format!("https://crates.io/crates/{name}"),
     }
 }
 
-/// Render the per-license sections as Markdown. The output carries no
-/// front matter so it can be shipped verbatim in the binary packages; the
-/// docs site generators (`docs/common/src/utils/thirdparty.ts`) prepend the
-/// Starlight front matter they need.
-fn render_markdown(sections: &[LicenseSection]) -> String {
+/// Escape a value for use inside a Markdown table cell: `|` would otherwise end
+/// the cell and newlines would break the row.
+fn table_cell(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('|', "\\|").replace(['\n', '\r'], " ")
+}
+
+/// Render the dependency tables followed by the license texts as Markdown. The
+/// output carries no front matter so it can be shipped verbatim in the binary
+/// packages; the docs site generators (`docs/common/src/utils/thirdparty.ts`)
+/// prepend the Starlight front matter they need.
+fn render_markdown(rows: &[CrateRow], sections: &[LicenseSection]) -> String {
     let mut out = String::new();
+    render_table(&mut out, "Runtime dependencies", rows, Usage::Runtime);
+    render_table(&mut out, "Shared dependencies", rows, Usage::Shared);
+    render_table(&mut out, "Build dependencies", rows, Usage::Build);
+
+    out.push_str("## License texts\n\n");
     for s in sections {
-        out.push_str(&format!("## <a id=\"{id}\"></a> {name}\n\n", id = s.id, name = s.name));
-        // Each variant is one distinct notice text shared by a set of crates;
-        // they are rendered as separate blocks so every copyright notice is
-        // reproduced.
-        for v in &s.variants {
-            out.push_str("### Used by:\n\n");
-            for c in &v.used_by {
-                out.push_str(&format!(
-                    "- [{name} {version}]({url})\n",
-                    name = c.name,
-                    version = c.version,
-                    url = crate_url(c)
-                ));
-            }
-            out.push_str(&format!(
-                "\n### License Text\n\n```\n{text}\n```\n\n",
-                text = v.text.trim_end()
-            ));
+        out.push_str(&format!("### <a id=\"{id}\"></a> {name}\n\n", id = s.id, name = s.name));
+        for text in &s.texts {
+            out.push_str(&format!("```\n{}\n```\n\n", text.trim_end()));
         }
     }
     out
+}
+
+/// Render one dependency table (Name / Author / License) for the crates with
+/// the given usage, sorted by name and version.
+fn render_table(out: &mut String, title: &str, rows: &[CrateRow], usage: Usage) {
+    out.push_str(&format!("## {title}\n\n"));
+    let mut selected: Vec<&CrateRow> = rows.iter().filter(|r| r.usage == usage).collect();
+    selected.sort_by(|a, b| a.name.cmp(&b.name).then(a.version.cmp(&b.version)));
+    if selected.is_empty() {
+        out.push_str("_None._\n\n");
+        return;
+    }
+    out.push_str("| Name | Author | License |\n| --- | --- | --- |\n");
+    for r in selected {
+        let author = if r.author.is_empty() { "—" } else { r.author.as_str() };
+        out.push_str(&format!(
+            "| [{name} {version}]({url}) | {author} | {license} |\n",
+            name = table_cell(&r.name),
+            version = table_cell(&r.version),
+            url = crate_url(&r.name, &r.repository),
+            author = table_cell(author),
+            license = table_cell(&r.license),
+        ));
+    }
+    out.push('\n');
 }
