@@ -598,7 +598,7 @@ fn render_table(
             version = table_cell(&r.version),
             url = crate_url(&r.name, &r.repository),
             author = table_cell(author),
-            license = linkify_license(&r.license, ids),
+            license = link_license_ids(&r.license, ids),
         ));
     }
     out.push('\n');
@@ -608,7 +608,7 @@ fn render_table(
 /// section, leaving operators (`OR`/`AND`/`WITH`), parentheses and unknown
 /// tokens untouched. SPDX expressions contain no `|`, so no cell escaping is
 /// needed.
-fn linkify_license(expression: &str, ids: &HashSet<&str>) -> String {
+fn link_license_ids(expression: &str, ids: &HashSet<&str>) -> String {
     let mut out = String::new();
     let mut token = String::new();
     for c in expression.chars() {
