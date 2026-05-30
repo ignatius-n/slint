@@ -557,9 +557,10 @@ fn table_cell(value: &str) -> String {
 /// prepend the Starlight front matter they need.
 fn render_markdown(rows: &[CrateRow], sections: &[LicenseSection]) -> String {
     let mut out = String::new();
-    render_table(&mut out, "Runtime dependencies", rows, Usage::Runtime);
-    render_table(&mut out, "Shared dependencies", rows, Usage::Shared);
-    render_table(&mut out, "Build dependencies", rows, Usage::Build);
+    let ids: HashSet<&str> = sections.iter().map(|s| s.id.as_str()).collect();
+    render_table(&mut out, "Runtime dependencies", rows, Usage::Runtime, &ids);
+    render_table(&mut out, "Shared dependencies", rows, Usage::Shared, &ids);
+    render_table(&mut out, "Build dependencies", rows, Usage::Build, &ids);
 
     out.push_str("## License texts\n\n");
     for s in sections {
@@ -572,8 +573,15 @@ fn render_markdown(rows: &[CrateRow], sections: &[LicenseSection]) -> String {
 }
 
 /// Render one dependency table (Name / Author / License) for the crates with
-/// the given usage, sorted by name and version.
-fn render_table(out: &mut String, title: &str, rows: &[CrateRow], usage: Usage) {
+/// the given usage, sorted by name and version. License ids found in `ids` are
+/// linked to their text section below.
+fn render_table(
+    out: &mut String,
+    title: &str,
+    rows: &[CrateRow],
+    usage: Usage,
+    ids: &HashSet<&str>,
+) {
     out.push_str(&format!("## {title}\n\n"));
     let mut selected: Vec<&CrateRow> = rows.iter().filter(|r| r.usage == usage).collect();
     selected.sort_by(|a, b| a.name.cmp(&b.name).then(a.version.cmp(&b.version)));
@@ -581,7 +589,7 @@ fn render_table(out: &mut String, title: &str, rows: &[CrateRow], usage: Usage) 
         out.push_str("_None._\n\n");
         return;
     }
-    out.push_str("| Name | Author | License |\n| --- | --- | --- |\n");
+    out.push_str("| Name | Author / Copyright | License |\n| --- | --- | --- |\n");
     for r in selected {
         let author = if r.author.is_empty() { "—" } else { r.author.as_str() };
         out.push_str(&format!(
@@ -590,8 +598,38 @@ fn render_table(out: &mut String, title: &str, rows: &[CrateRow], usage: Usage) 
             version = table_cell(&r.version),
             url = crate_url(&r.name, &r.repository),
             author = table_cell(author),
-            license = table_cell(&r.license),
+            license = linkify_license(&r.license, ids),
         ));
     }
     out.push('\n');
+}
+
+/// Turn each known SPDX license id in `expression` into a link to its text
+/// section, leaving operators (`OR`/`AND`/`WITH`), parentheses and unknown
+/// tokens untouched. SPDX expressions contain no `|`, so no cell escaping is
+/// needed.
+fn linkify_license(expression: &str, ids: &HashSet<&str>) -> String {
+    let mut out = String::new();
+    let mut token = String::new();
+    for c in expression.chars() {
+        if c.is_alphanumeric() || matches!(c, '.' | '-' | '+') {
+            token.push(c);
+        } else {
+            push_license_token(&mut out, &token, ids);
+            token.clear();
+            out.push(c);
+        }
+    }
+    push_license_token(&mut out, &token, ids);
+    out
+}
+
+fn push_license_token(out: &mut String, token: &str, ids: &HashSet<&str>) {
+    if token.is_empty() {
+        // nothing to flush
+    } else if ids.contains(token) {
+        out.push_str(&format!("[{token}](#{token})"));
+    } else {
+        out.push_str(token);
+    }
 }
